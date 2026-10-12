@@ -1,0 +1,454 @@
+/*
+ * weka_knowledgeflow.c
+ * The three Knowledge Flow tasks, in C:
+ *   1. Association rules: Apriori vs FP-Growth (support, confidence, lift)
+ *   2. 10-fold cross-validation with a J48-style (C4.5) tree
+ *   3. ROC curves and AUC: J48 vs RandomForest  (writes roc_curves.svg)
+ *
+ * Compile: gcc -O2 -o weka_kf weka_knowledgeflow.c -lm
+ * Run    : ./weka_kf iris.csv [roc_curves.svg]
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+
+/* ========================================================================= */
+/*  PART 1: ASSOCIATION RULES (weather.nominal)                              */
+/* ========================================================================= */
+#define NT 14
+#define NI 12
+typedef unsigned int Mask;
+
+static const char *item_name[NI] = {
+    "outlook=sunny","outlook=overcast","outlook=rainy",
+    "temperature=hot","temperature=mild","temperature=cool",
+    "humidity=high","humidity=normal","windy=TRUE","windy=FALSE",
+    "play=yes","play=no"};
+static const int tdata[NT][5] = {
+    {0,3,6,9,11},{0,3,6,8,11},{1,3,6,9,10},{2,4,6,9,10},{2,5,7,9,10},
+    {2,5,7,8,11},{1,5,7,8,10},{0,4,6,9,11},{0,5,7,9,10},{2,4,7,9,10},
+    {0,4,7,8,10},{1,4,6,8,10},{1,3,7,9,10},{2,4,6,8,11}};
+static Mask trans[NT];
+
+static int popcnt(Mask m) { int c = 0; while (m) { c += m & 1; m >>= 1; } return c; }
+static int count_trans(Mask m) { int c = 0; for (int t = 0; t < NT; t++) if ((trans[t] & m) == m) c++; return c; }
+
+typedef struct { Mask m; int s; } Itemset;
+static int cmp_set(const void *a, const void *b) {
+    Mask x = ((const Itemset *)a)->m, y = ((const Itemset *)b)->m;
+    return (x > y) - (x < y);
+}
+
+/* ---- Apriori: level-wise candidate generation + subset pruning ---- */
+static Itemset ap[4096]; static int nap = 0; static long ap_scans = 0;
+
+static void apriori(int minc) {
+    Mask cur[512]; int ncur = 0;
+    nap = 0;
+    for (int i = 0; i < NI; i++) {
+        ap_scans++;
+        int s = count_trans(1u << i);
+        if (s >= minc) { cur[ncur++] = 1u << i; ap[nap++] = (Itemset){1u << i, s}; }
+    }
+    while (ncur > 1) {
+        int k = popcnt(cur[0]);
+        Mask nxt[512]; int nn = 0;
+        for (int a = 0; a < ncur; a++)
+            for (int b = a + 1; b < ncur; b++) {
+                Mask u = cur[a] | cur[b];
+                if (popcnt(u) != k + 1) continue;
+                int dup = 0;
+                for (int q = 0; q < nn; q++) if (nxt[q] == u) { dup = 1; break; }
+                if (dup) continue;
+                int ok = 1;                                   /* every k-subset must be frequent */
+                for (int bit = 0; bit < NI && ok; bit++) {
+                    if (!(u & (1u << bit))) continue;
+                    Mask sub = u & ~(1u << bit), found = 0;
+                    for (int q = 0; q < ncur; q++) if (cur[q] == sub) { found = 1; break; }
+                    if (!found) ok = 0;
+                }
+                if (!ok) continue;
+                ap_scans++;
+                int s = count_trans(u);
+                if (s >= minc) { nxt[nn++] = u; ap[nap++] = (Itemset){u, s}; }
+            }
+        memcpy(cur, nxt, nn * sizeof(Mask)); ncur = nn;
+    }
+}
+
+/* ---- FP-Growth: FP-tree + conditional pattern bases ---- */
+typedef struct { int item, count, parent, next, child[NI]; } FPNode;
+typedef struct { FPNode nd[400]; int nn; int head[NI]; } FPTree;
+
+static Itemset fp[4096]; static int nfp = 0;
+static int rank_of[NI], ritem[NI], nfreq = 0;
+
+static void fp_init(FPTree *t) {
+    t->nn = 1;
+    t->nd[0].item = -1; t->nd[0].count = 0; t->nd[0].parent = -1; t->nd[0].next = -1;
+    for (int i = 0; i < NI; i++) { t->nd[0].child[i] = -1; t->head[i] = -1; }
+}
+static void fp_insert(FPTree *t, const int *items, int len, int cnt) {
+    int cur = 0;
+    for (int k = 0; k < len; k++) {
+        int it = items[k], ch = t->nd[cur].child[it];
+        if (ch < 0) {
+            ch = t->nn++;
+            FPNode *x = &t->nd[ch];
+            x->item = it; x->count = 0; x->parent = cur;
+            for (int i = 0; i < NI; i++) x->child[i] = -1;
+            x->next = t->head[it]; t->head[it] = ch;
+            t->nd[cur].child[it] = ch;
+        }
+        t->nd[ch].count += cnt; cur = ch;
+    }
+}
+static void fp_mine(const FPTree *t, Mask suffix, int minc) {
+    for (int r = nfreq - 1; r >= 0; r--) {                    /* least frequent first */
+        int i = ritem[r];
+        if (t->head[i] < 0) continue;
+        int sup = 0;
+        for (int x = t->head[i]; x >= 0; x = t->nd[x].next) sup += t->nd[x].count;
+        if (sup < minc) continue;
+        Mask ns = suffix | (1u << i);
+        fp[nfp++] = (Itemset){ns, sup};
+
+        int paths[64][NI], plen[64], pcnt[64], np = 0, citem[NI] = {0};
+        for (int x = t->head[i]; x >= 0; x = t->nd[x].next) {
+            int tmp[NI], l = 0;
+            for (int p = t->nd[x].parent; p > 0; p = t->nd[p].parent) tmp[l++] = t->nd[p].item;
+            for (int k = 0; k < l; k++) { paths[np][k] = tmp[l - 1 - k]; citem[tmp[k]] += t->nd[x].count; }
+            plen[np] = l; pcnt[np] = t->nd[x].count; np++;
+        }
+        FPTree *ct = malloc(sizeof(FPTree));
+        fp_init(ct);
+        for (int q = 0; q < np; q++) {
+            int f[NI], fl = 0;
+            for (int k = 0; k < plen[q]; k++) if (citem[paths[q][k]] >= minc) f[fl++] = paths[q][k];
+            if (fl) fp_insert(ct, f, fl, pcnt[q]);
+        }
+        if (ct->nn > 1) fp_mine(ct, ns, minc);
+        free(ct);
+    }
+}
+static int fp_tree_nodes = 0;
+static void fpgrowth(int minc) {
+    int cnt[NI];
+    for (int i = 0; i < NI; i++) cnt[i] = count_trans(1u << i);
+    nfreq = 0;
+    for (int i = 0; i < NI; i++) rank_of[i] = -1;
+    int used[NI] = {0};
+    for (;;) {                                               /* rank: count desc, id asc */
+        int b = -1;
+        for (int i = 0; i < NI; i++) if (!used[i] && cnt[i] >= minc && (b < 0 || cnt[i] > cnt[b])) b = i;
+        if (b < 0) break;
+        used[b] = 1; rank_of[b] = nfreq; ritem[nfreq++] = b;
+    }
+    FPTree *t = malloc(sizeof(FPTree));
+    fp_init(t);
+    for (int tr = 0; tr < NT; tr++) {
+        int items[NI], l = 0;
+        for (int r = 0; r < nfreq; r++) if (trans[tr] & (1u << ritem[r])) items[l++] = ritem[r];
+        fp_insert(t, items, l, 1);
+    }
+    fp_tree_nodes = t->nn - 1;
+    nfp = 0;
+    fp_mine(t, 0, minc);
+    free(t);
+}
+
+/* ---- rules from frequent itemsets ---- */
+typedef struct { Mask a, c; int sa, sall; double conf, lift; } Rule;
+static Rule rules[30000]; static int nr = 0;
+static int cmp_rule(const void *p, const void *q) {
+    const Rule *x = p, *y = q;
+    if (y->lift > x->lift + 1e-9) return 1;
+    if (x->lift > y->lift + 1e-9) return -1;
+    if (y->sall != x->sall) return y->sall - x->sall;
+    return (int)x->a - (int)y->a;
+}
+static void print_items(Mask m) {
+    int first = 1;
+    for (int i = 0; i < NI; i++) if (m & (1u << i)) { printf("%s%s", first ? "" : " ", item_name[i]); first = 0; }
+}
+static void assoc_demo(void) {
+    for (int t = 0; t < NT; t++) { trans[t] = 0; for (int a = 0; a < 5; a++) trans[t] |= 1u << tdata[t][a]; }
+    const int minc = 2; const double minconf = 0.9;
+    printf("################ 1. Association rules on weather.nominal ################\n\n");
+    printf("Minimum support: %d transactions (%.2f)    Minimum confidence: %.2f\n\n", minc, (double)minc / NT, minconf);
+    apriori(minc);
+    fpgrowth(minc);
+
+    qsort(ap, nap, sizeof(Itemset), cmp_set);
+    qsort(fp, nfp, sizeof(Itemset), cmp_set);
+    int same = (nap == nfp);
+    for (int i = 0; same && i < nap; i++) if (ap[i].m != fp[i].m || ap[i].s != fp[i].s) same = 0;
+    int bysize[6] = {0};
+    for (int i = 0; i < nap; i++) bysize[popcnt(ap[i].m)]++;
+    printf("%-34s %s\n", "", "Apriori      FP-Growth");
+    printf("%-34s %-12d %d\n", "Frequent itemsets found", nap, nfp);
+    printf("%-34s %-12ld %d\n", "Work (candidates / FP nodes)", ap_scans, fp_tree_nodes);
+    printf("Frequent itemsets by size  L1..L4: %d, %d, %d, %d\n", bysize[1], bysize[2], bysize[3], bysize[4]);
+    printf("Both algorithms return exactly the same itemsets and supports: %s\n", same ? "YES" : "NO");
+    printf("(Apriori counted %ld candidates against the data; FP-Growth stored all %d transactions\n"
+           " in an FP-tree of only %d nodes and never generated candidates.)\n\n", ap_scans, NT, fp_tree_nodes);
+
+    nr = 0;
+    for (int f = 0; f < nfp; f++) {
+        Mask s = fp[f].m;
+        if (popcnt(s) < 2) continue;
+        for (Mask a = (s - 1) & s; a; a = (a - 1) & s) {
+            Mask c = s & ~a;
+            int sa = count_trans(a), sc = count_trans(c);
+            double conf = (double)fp[f].s / sa;
+            if (conf + 1e-9 < minconf) continue;
+            rules[nr++] = (Rule){a, c, sa, fp[f].s, conf, conf / ((double)sc / NT)};
+        }
+    }
+    qsort(rules, nr, sizeof(Rule), cmp_rule);
+    printf("%d rules reach confidence >= %.1f. Top 8 ranked by lift:\n\n", nr, minconf);
+    printf("%-52s %5s %5s %5s\n", "Rule", "supp", "conf", "lift");
+    for (int i = 0; i < nr && i < 8; i++) {
+        printf("%d. ", i + 1);
+        print_items(rules[i].a); printf(" ==> "); print_items(rules[i].c);
+        printf("\n     support %d/%d = %.3f   confidence %.2f   lift %.2f\n",
+               rules[i].sall, NT, (double)rules[i].sall / NT, rules[i].conf, rules[i].lift);
+    }
+    printf("\nLift check for rule 1: P(consequent | antecedent) / P(consequent) = %.2f / %.3f = %.2f\n",
+           rules[0].conf, (double)count_trans(rules[0].c) / NT, rules[0].lift);
+}
+
+/* ========================================================================= */
+/*  PARTS 2 & 3: iris, J48 cross-validation, RandomForest, ROC / AUC        */
+/* ========================================================================= */
+#define MAXN 200
+#define NA 4
+#define NC 3
+static double X[MAXN][NA]; static int Y[MAXN]; static int n = 0, ncls = 0; static char cname[NC][24];
+
+static int load_csv(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256], lab[64];
+    while (fgets(line, sizeof line, f) && n < MAXN) {
+        double v[NA];
+        if (sscanf(line, "%lf,%lf,%lf,%lf,%63[^\r\n]", &v[0], &v[1], &v[2], &v[3], lab) != 5) continue;
+        int c;
+        for (c = 0; c < ncls; c++) if (!strcmp(cname[c], lab)) break;
+        if (c == ncls) strcpy(cname[ncls++], lab);
+        for (int a = 0; a < NA; a++) X[n][a] = v[a];
+        Y[n++] = c;
+    }
+    fclose(f);
+    return n;
+}
+
+/* ---- decision tree: gain ratio (J48) or information gain (random forest) ---- */
+typedef struct Tn { int leaf, attr, cls; double thr, w, dist[NC]; struct Tn *lo, *hi; } Tn;
+
+static double entropy(const double *cnt, double tot) {
+    double e = 0;
+    if (tot <= 0) return 0;
+    for (int c = 0; c < ncls; c++) if (cnt[c] > 0) { double p = cnt[c] / tot; e -= p * log2(p); }
+    return e;
+}
+static int g_attr;
+static int cmp_attr(const void *a, const void *b) {
+    double x = X[*(const int *)a][g_attr], y = X[*(const int *)b][g_attr];
+    return (x > y) - (x < y);
+}
+
+static Tn *grow(int *idx, int m, int min_leaf, int mtry, int use_ratio) {
+    Tn *nd = calloc(1, sizeof(Tn));
+    for (int i = 0; i < m; i++) nd->dist[Y[idx[i]]] += 1;
+    nd->w = m;
+    for (int c = 1; c < ncls; c++) if (nd->dist[c] > nd->dist[nd->cls]) nd->cls = c;
+    if (nd->dist[nd->cls] == m || m < 2 * min_leaf) { nd->leaf = 1; return nd; }
+
+    double base = entropy(nd->dist, m), best = 0, bthr = 0;
+    int battr = -1;
+    for (int pass = 0; pass < 2 && battr < 0; pass++) {
+        int attrs[NA], na = NA;
+        for (int a = 0; a < NA; a++) attrs[a] = a;
+        if (mtry > 0 && pass == 0) {                          /* random feature subset */
+            for (int a = NA - 1; a > 0; a--) { int j = rand() % (a + 1); int t = attrs[a]; attrs[a] = attrs[j]; attrs[j] = t; }
+            na = mtry;
+        }
+        for (int ai = 0; ai < na; ai++) {
+            int a = attrs[ai];
+            g_attr = a;
+            qsort(idx, m, sizeof(int), cmp_attr);
+            double left[NC] = {0}, right[NC];
+            for (int i = 0; i < m - 1; i++) {
+                left[Y[idx[i]]] += 1;
+                double v1 = X[idx[i]][a], v2 = X[idx[i + 1]][a];
+                if (v1 == v2) continue;
+                int nl = i + 1, nr2 = m - nl;
+                if (nl < min_leaf || nr2 < min_leaf) continue;
+                for (int c = 0; c < ncls; c++) right[c] = nd->dist[c] - left[c];
+                double pl = (double)nl / m, pr = (double)nr2 / m;
+                double gain = base - pl * entropy(left, nl) - pr * entropy(right, nr2);
+                double score = use_ratio ? gain / (-(pl * log2(pl) + pr * log2(pr))) : gain;
+                if (score > best + 1e-12) { best = score; battr = a; bthr = (v1 + v2) / 2; }
+            }
+        }
+    }
+    if (battr < 0) { nd->leaf = 1; return nd; }
+    int *lo = malloc(m * sizeof(int)), *hi = malloc(m * sizeof(int)), nl = 0, nh = 0;
+    for (int i = 0; i < m; i++) { if (X[idx[i]][battr] <= bthr) lo[nl++] = idx[i]; else hi[nh++] = idx[i]; }
+    nd->attr = battr; nd->thr = bthr;
+    nd->lo = grow(lo, nl, min_leaf, mtry, use_ratio);
+    nd->hi = grow(hi, nh, min_leaf, mtry, use_ratio);
+    free(lo); free(hi);
+    return nd;
+}
+static double sub_err(const Tn *nd) { return nd->leaf ? nd->w - nd->dist[nd->cls] : sub_err(nd->lo) + sub_err(nd->hi); }
+static void prune(Tn *nd) {
+    if (nd->leaf) return;
+    prune(nd->lo); prune(nd->hi);
+    if (nd->w - nd->dist[nd->cls] <= sub_err(nd) + 0.5) nd->leaf = 1;
+}
+static const Tn *leaf_of(const Tn *nd, const double *x) {
+    while (!nd->leaf) nd = x[nd->attr] <= nd->thr ? nd->lo : nd->hi;
+    return nd;
+}
+static void free_tree(Tn *nd) { if (nd) { free_tree(nd->lo); free_tree(nd->hi); free(nd); } }
+
+#define NTREES 100
+#define MTRY   3                       /* log2(4) + 1, WEKA's default */
+
+/* pooled out-of-fold class probabilities */
+static double P_j48[MAXN][NC], P_rf[MAXN][NC];
+static int    fold_of[MAXN], fold_n[10], fold_ok[10];
+
+static void run_cv(void) {
+    int perm[MAXN];
+    for (int i = 0; i < n; i++) perm[i] = i;
+    srand(1);
+    for (int i = n - 1; i > 0; i--) { int j = rand() % (i + 1); int t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+    int pos = 0;
+    for (int c = 0; c < ncls; c++) for (int i = 0; i < n; i++) if (Y[perm[i]] == c) fold_of[perm[i]] = (pos++) % 10;
+
+    srand(7);
+    for (int f = 0; f < 10; f++) {
+        int train[MAXN], nt = 0;
+        for (int i = 0; i < n; i++) if (fold_of[i] != f) train[nt++] = i;
+        int tmp[MAXN];
+        memcpy(tmp, train, nt * sizeof(int));
+        Tn *j48 = grow(tmp, nt, 2, 0, 1);
+        prune(j48);
+        Tn *forest[NTREES];
+        for (int b = 0; b < NTREES; b++) {
+            int boot[MAXN];
+            for (int i = 0; i < nt; i++) boot[i] = train[rand() % nt];
+            forest[b] = grow(boot, nt, 1, MTRY, 0);
+        }
+        for (int i = 0; i < n; i++) {
+            if (fold_of[i] != f) continue;
+            const Tn *lf = leaf_of(j48, X[i]);
+            for (int c = 0; c < ncls; c++) P_j48[i][c] = lf->dist[c] / lf->w;
+            for (int c = 0; c < ncls; c++) P_rf[i][c] = 0;
+            for (int b = 0; b < NTREES; b++) {
+                const Tn *l2 = leaf_of(forest[b], X[i]);
+                for (int c = 0; c < ncls; c++) P_rf[i][c] += l2->dist[c] / l2->w / NTREES;
+            }
+            int p = 0;
+            for (int c = 1; c < ncls; c++) if (P_j48[i][c] > P_j48[i][p]) p = c;
+            fold_n[f]++; if (p == Y[i]) fold_ok[f]++;
+        }
+        free_tree(j48);
+        for (int b = 0; b < NTREES; b++) free_tree(forest[b]);
+    }
+}
+
+static int argmax(const double *p) { int b = 0; for (int c = 1; c < ncls; c++) if (p[c] > p[b]) b = c; return b; }
+
+static double auc(double P[][NC], int cls) {                 /* Mann-Whitney AUC, ties count 1/2 */
+    double s = 0; long np = 0, nn = 0;
+    for (int i = 0; i < n; i++) {
+        if (Y[i] != cls) continue;
+        np++;
+    }
+    nn = n - np;
+    for (int i = 0; i < n; i++) {
+        if (Y[i] != cls) continue;
+        for (int j = 0; j < n; j++) {
+            if (Y[j] == cls) continue;
+            s += P[i][cls] > P[j][cls] ? 1 : (P[i][cls] == P[j][cls] ? 0.5 : 0);
+        }
+    }
+    return s / ((double)np * nn);
+}
+
+static void metrics(double P[][NC], double *acc, double *kappa) {
+    int cm[NC][NC] = {{0}}, row[NC] = {0}, col[NC] = {0}, ok = 0;
+    for (int i = 0; i < n; i++) cm[Y[i]][argmax(P[i])]++;
+    for (int a = 0; a < ncls; a++) for (int b = 0; b < ncls; b++) { row[a] += cm[a][b]; col[b] += cm[a][b]; }
+    for (int c = 0; c < ncls; c++) ok += cm[c][c];
+    double po = (double)ok / n, pe = 0;
+    for (int c = 0; c < ncls; c++) pe += ((double)row[c] / n) * ((double)col[c] / n);
+    *acc = 100 * po; *kappa = (po - pe) / (1 - pe);
+}
+
+static void cv_demo(void) {
+    printf("\n\n################ 2. Cross-validation with J48 (iris) ################\n\n");
+    printf("Flow: ArffLoader -> ClassAssigner (last attribute) -> CrossValidationFoldMaker (10)\n");
+    printf("      -> J48 -> ClassifierPerformanceEvaluator -> TextViewer\n\n");
+    printf("%5s %7s %6s %9s %9s\n", "Fold", "Train", "Test", "Correct", "Accuracy");
+    int tot_ok = 0;
+    for (int f = 0; f < 10; f++) {
+        printf("%5d %7d %6d %9d %8.1f%%\n", f + 1, n - fold_n[f], fold_n[f], fold_ok[f], 100.0 * fold_ok[f] / fold_n[f]);
+        tot_ok += fold_ok[f];
+    }
+    double acc, kappa;
+    metrics(P_j48, &acc, &kappa);
+    double mean = 0, var = 0;
+    for (int f = 0; f < 10; f++) mean += 100.0 * fold_ok[f] / fold_n[f] / 10;
+    for (int f = 0; f < 10; f++) { double d = 100.0 * fold_ok[f] / fold_n[f] - mean; var += d * d / 9; }
+    printf("\nOverall: %d / %d correct = %.4f %%   Kappa = %.4f\n", tot_ok, n, acc, kappa);
+    printf("Per-fold accuracy: mean %.2f %%, std dev %.2f points\n", mean, sqrt(var));
+}
+
+/* ---- ROC curve points (pooled predictions) ---- */
+static const double *g_sc;
+static int cmp_sc(const void *a, const void *b) {
+    double x = g_sc[*(const int *)a], y = g_sc[*(const int *)b];
+    return (y > x) - (y < x);                                /* descending */
+}
+static int roc_points(double P[][NC], int cls, double *fx, double *fy) {
+    double sc[MAXN]; int idx[MAXN], np = 0, nn;
+    for (int i = 0; i < n; i++) { sc[i] = P[i][cls]; idx[i] = i; if (Y[i] == cls) np++; }
+    nn = n - np;
+    g_sc = sc;
+    qsort(idx, n, sizeof(int), cmp_sc);
+    int k = 0, tp = 0, fp2 = 0;
+    fx[k] = 0; fy[k] = 0; k++;
+    for (int i = 0; i < n;) {
+        int j = i;
+        while (j < n && sc[idx[j]] == sc[idx[i]]) { if (Y[idx[j]] == cls) tp++; else fp2++; j++; }
+        fx[k] = (double)fp2 / nn; fy[k] = (double)tp / np; k++;
+        i = j;
+    }
+    return k;
+}
+
+static void svg_panel(FILE *f, double ox, double oy, int cls) {
+    const double W = 300, H = 300;
+    double fx[MAXN + 2], fy[MAXN + 2];
+    fprintf(f, "<g transform=\"translate(%.0f,%.0f)\">\n", ox, oy);
+    fprintf(f, "<text x=\"%.0f\" y=\"-12\" text-anchor=\"middle\" font-size=\"14\" font-weight=\"bold\">%s vs rest</text>\n", W / 2, cname[cls]);
+    fprintf(f, "<rect x=\"0\" y=\"0\" width=\"%.0f\" height=\"%.0f\" fill=\"none\" stroke=\"#444\"/>\n", W, H);
+    for (int g = 1; g < 5; g++) {
+        fprintf(f, "<line x1=\"%.1f\" y1=\"0\" x2=\"%.1f\" y2=\"%.0f\" stroke=\"#ddd\"/>\n", W * g / 5, W * g / 5, H);
+        fprintf(f, "<line x1=\"0\" y1=\"%.1f\" x2=\"%.0f\" y2=\"%.1f\" stroke=\"#ddd\"/>\n", H * g / 5, W, H * g / 5);
+    }
+    fprintf(f, "<line x1=\"0\" y1=\"%.0f\" x2=\"%.0f\" y2=\"0\" stroke=\"#999\" stroke-dasharray=\"5,4\"/>\n", H, W);
+    for (int m = 0; m < 2; m++) {
+        double (*P)[NC] = m ? P_rf : P_j48;
+        int k = roc_points(P, cls, fx, fy);
+        fprintf(f, "<polyline fill=\"none\" stroke=\"%s\" stroke-width=\"2.5\" points=\"", m ? "#d95f02" : "#1f77b4");
+        for (int i = 0; i < k; i++) fprintf(f, "%.1f,%.1f ", fx[i] * W, H - fy[i] * H);
+        fprintf(f, "\"/>\n");
+        fprintf(f, "<text x=\"%.0f\" y=\"%.0f\" font-size=\"12\" fill=\"%s\">%s  AUC = %.4f</text
